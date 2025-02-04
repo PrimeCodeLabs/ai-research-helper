@@ -4,8 +4,6 @@ from datetime import datetime
 import re
 import gradio as gr
 from typing import List, Dict, Tuple, Optional
-from langchain_huggingface import HuggingFaceEndpoint
-from langchain.prompts import PromptTemplate
 from fastapi import FastAPI
 import uvicorn
 import sqlite3
@@ -13,20 +11,25 @@ import json
 import hashlib
 import asyncio
 from tavily import AsyncTavilyClient
+from langchain_community.llms import HuggingFaceHub
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 MODEL_CONFIG = {
     "analytical": {
-        "repo_id": "meta-llama/Meta-Llama-3-8B",
+        "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
         "temperature": 0.3,
-        "max_new_tokens": 4096
+        "max_new_tokens": 2048,
+        "top_p": 0.9,
+        "top_k": 50,
+        "repetition_penalty": 1.1
     }
 }
 
 class PersistentCacheManager:
     def __init__(self, ttl=3600):
         self.conn = sqlite3.connect('cache.db')
+        self.conn.execute("PRAGMA journal_mode = WAL")
         self._init_db()
         self.ttl = ttl
 
@@ -70,11 +73,13 @@ class HybridSearchClient:
 
         try:
             response = await self.tavily.search(
-                query=query,
+                query,
                 search_depth="advanced",
-                max_results=10,
+                max_results=15,
                 include_answer=True,
-                include_raw_content=True
+                include_raw_content=True,
+                include_images=True,
+                max_age=5*365*24*60*60
             )
             
             processed = {
@@ -92,28 +97,42 @@ class HybridSearchClient:
 
 class MultiModelManager:
     def __init__(self):
-        self.model = HuggingFaceEndpoint(
-            repo_id=MODEL_CONFIG["analytical"]["repo_id"],
-            task="text-generation",
-            temperature=MODEL_CONFIG["analytical"]["temperature"],
-            max_new_tokens=MODEL_CONFIG["analytical"]["max_new_tokens"],
-            do_sample=True,
-            return_full_text=False,
-            top_p=0.9,
-            top_k=50,
-            repetition_penalty=1.1,
+        self.llm = HuggingFaceHub(
+            repo_id=MODEL_CONFIG["analytical"]["model"],
+            model_kwargs={
+                "temperature": MODEL_CONFIG["analytical"]["temperature"],
+                "max_new_tokens": MODEL_CONFIG["analytical"]["max_new_tokens"],
+                "top_p": MODEL_CONFIG["analytical"]["top_p"],
+                "top_k": MODEL_CONFIG["analytical"]["top_k"],
+                "repetition_penalty": MODEL_CONFIG["analytical"]["repetition_penalty"],
+            },
             huggingfacehub_api_token=os.getenv("HUGGINGFACE_API_TOKEN")
         )
 
+    async def generate(self, prompt: str) -> str:
+        try:
+            response = await asyncio.to_thread(self.llm.invoke, prompt)
+            cleaned = re.sub(r'<\/?s>|\[INST\]|<<\/?SYS>>|<\/?INST>', '', response)
+            return cleaned.split("<|eot_id|>")[0].strip()
+        except Exception as e:
+            logging.error(f"Generation error: {str(e)}")
+            raise
+
 class ResearchAgent:
     def __init__(self):
-        self.model = MultiModelManager().model
+        self.model = MultiModelManager()
         self.search = HybridSearchClient()
-        self.answer_template = PromptTemplate.from_template(
-            "Given the search results, answer the query.\n"
-            "Query: {query}\n"
-            "Search Results:\n{results}\n\n"
-            "Provide a comprehensive answer with sources:"
+        self.answer_template = (
+            "<s>[INST] Create a comprehensive report in markdown format based on these sources. "
+            "Use natural section headers without numbering. Focus on key facts and quantitative data. "
+            "Formatting requirements:\n"
+            "- Use ## for section headers\n"
+            "- Use bullet points for lists\n"
+            "- Bold important terms\n"
+            "- Never mention sources or formatting instructions\n\n"
+            "Query: {query}\n\n"
+            "Source Materials:\n{results}\n"
+            "[/INST]"
         )
 
     async def research(self, query: str) -> Dict:
@@ -121,38 +140,35 @@ class ResearchAgent:
             search_results = await self.search.search(query)
             if "error" in search_results:
                 return {"error": search_results["error"]}
-                
-            if search_results.get("answer"):
-                return self._format_answer(search_results, query)
-                
             return await self._generate_answer(query, search_results)
             
         except Exception as e:
             logging.error(f"Research error: {str(e)}")
             return {"error": str(e)}
 
-    def _format_answer(self, results: Dict, query: str) -> Dict:
-        return {
-            "content": f"{results['answer']}\n\nSources: {self._format_sources(results['results'])}",
-            "sources": results["results"]
-        }
-
     async def _generate_answer(self, query: str, results: Dict) -> Dict:
         context = "\n".join([
-            f"Source {i+1}: {res['title']}\nContent: {res['content'][:200]}..." 
+            f"Source {i+1}: {res['title']}\n"
+            f"Content: {res['content'][:300].strip()}{'...' if len(res['content']) > 300 else ''}\n"
             for i, res in enumerate(results["results"])
         ])
-        
+
         prompt = self.answer_template.format(query=query, results=context)
         
         try:
-            response = await asyncio.to_thread(self.model.generate, [{"query": query, "context": context}])
-            content = response.generations[0][0].text.strip()
-            if not content:
+            response = await self.model.generate(prompt)
+            cleaned_response = re.sub(
+                r'(?:\(Source \d+\)|\[.*?\]|\d+\.\s|\-+\s*|`{3,}|##\s*Formatting\s+requirements|'
+                r'Never\s+mention\s+sources\s+or\s+formatting\s+instructions)',
+                '',
+                response
+            ).strip()
+            
+            if not cleaned_response:
                 raise ValueError("Empty response from model")
                 
             return {
-                "content": f"{content}\n\n**Sources:**\n{self._format_sources(results['results'])}",
+                "content": cleaned_response,
                 "sources": results["results"]
             }
         except Exception as e:
@@ -162,12 +178,9 @@ class ResearchAgent:
     def _handle_fallback(self, query: str, results: Dict) -> Dict:
         summary = "\n".join([f"- {res['title']}: {res['content'][:100]}" for res in results["results"]])
         return {
-            "content": f"I found these relevant results:\n{summary}",
+            "content": f"**Preliminary Findings**\n\n{summary}",
             "sources": results["results"]
         }
-
-    def _format_sources(self, sources: List[Dict]) -> str:
-        return "\n".join([f"{i+1}. {s['url']}" for i, s in enumerate(sources[:3])])
 
 def create_gradio_interface():
     research_agent = ResearchAgent()
@@ -176,36 +189,46 @@ def create_gradio_interface():
         try:
             response = await research_agent.research(query)
             if "error" in response:
-                return [(query, f"Error: {response['error']}")], []
+                return history + [(query, f"**Error**: {response['error']}")], []
             
             answer = response["content"]
-            sources = [s["url"] for s in response.get("sources", [])][:3]
+            sources = [[s["title"], s["url"]] for s in response.get("sources", [])]
             return history + [(query, answer)], sources
             
         except Exception as e:
             logging.error(f"UI Query Error: {str(e)}")
-            return history + [(query, f"Error: {str(e)}")], []
+            return history + [(query, f"**Error**: {str(e)}")], []
     
     def clear_input():
-        return ""  # Only clear the input box, not the chat history
+        return ""
 
-    with gr.Blocks(theme=gr.themes.Soft()) as interface:
-        gr.Markdown("# AI Research Assistant")
+    with gr.Blocks(theme=gr.themes.Soft(), css=".markdown {max-width: 800px; margin: auto}") as interface:
+        gr.Markdown("# 🔍 AI Research Assistant")
         
         with gr.Tabs():
             with gr.Tab("Chat"):
-                chatbot = gr.Chatbot(height=500, render_markdown=True)
+                chatbot = gr.Chatbot(
+                    height=600,
+                    render_markdown=True,
+                    bubble_full_width=False
+                )
                 query_box = gr.Textbox(
                     label="Research Query",
                     placeholder="Enter your question...",
-                    lines=2
+                    lines=2,
+                    max_lines=5
                 )
                 with gr.Row():
                     submit_btn = gr.Button("Search", variant="primary")
-                    clear_btn = gr.Button("Clear")
-            
-            with gr.Tab("Sources"):
-                sources_display = gr.JSON(label="Top Sources", value=[], every=1)
+                    clear_btn = gr.Button("Clear History")
+
+            with gr.Tab("References"):
+                sources_display = gr.DataFrame(
+                    headers=["Title", "URL"],
+                    datatype=["str", "markdown"],
+                    col_count=(2, "fixed"),
+                    interactive=False
+                )
 
         submit_btn.click(
             fn=process_query,
@@ -228,13 +251,12 @@ def create_gradio_interface():
         )
 
         clear_btn.click(
-            fn=clear_input,
+            fn=lambda: [],
             inputs=[],
-            outputs=[query_box]
+            outputs=[chatbot]
         )
 
     return interface
-
 
 app = FastAPI(title="Research Assistant")
 gradio_app = create_gradio_interface()
