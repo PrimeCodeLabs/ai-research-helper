@@ -1,46 +1,50 @@
 # ---------------------------------------------------
-# 1. Builder Stage
-#    Installs build deps and pinned Python packages
+# 1. Builder Stage - Optimized with cache cleaning
 # ---------------------------------------------------
 FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
-# Copy ONLY the requirements file first to leverage Docker layer caching
-COPY requirements.txt ./
+# Copy requirements first for better layer caching
+COPY requirements.txt .
 
-# Install build-essential (if you have any C-extensions or if you might need it),
-# then install pinned dependencies in one shot.
+# Install system dependencies and build environment
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential && \
-    rm -rf /var/lib/apt/lists/* && \
+    apt-get install -y --no-install-recommends \
+    build-essential && \
+    # Create virtual environment
     python -m venv /opt/venv && \
     . /opt/venv/bin/activate && \
-    pip install --upgrade pip && \
+    # Install Python dependencies
+    pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
-    # remove build-essential so the final builder image is slimmer
-    apt-get remove -y build-essential && apt-get autoremove -y
+    # Clean build dependencies
+    apt-get remove -y build-essential && \
+    apt-get autoremove -y && \
+    apt-get clean -y && \
+    rm -rf /var/lib/apt/lists/* && \
+    # Remove Python cache files
+    find /opt/venv -type d -name '__pycache__' -exec rm -rf {} + && \
+    find /opt/venv -type f -name '*.pyc' -delete
 
 # ---------------------------------------------------
-# 2. Final Runtime Stage
-#    Copies only the venv + your app code
+# 2. Final Runtime Stage - Minimized
 # ---------------------------------------------------
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Copy over the virtual environment from the builder
+# Copy optimized virtual environment
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy your Python source code into the final image
-# e.g. your Gradio app script "my_app.py":
+# Copy application code
 COPY research_helper.py .
 
-# (Optional) Create a non-root user
-RUN useradd -m appuser && chown -R appuser /app
+# Security: Create and switch to non-root user
+RUN useradd -m appuser && \
+    chown -R appuser /app
 USER appuser
 
 EXPOSE 8000
 CMD ["uvicorn", "research_helper:app", "--host", "0.0.0.0", "--port", "8000"]
-
