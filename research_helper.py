@@ -158,10 +158,10 @@ class ResearchAgent:
         try:
             response = await self.model.generate(prompt)
             cleaned_response = re.sub(
-                r'(?:\(Source \d+\)|\[.*?\]|\d+\.\s|\-+\s*|`{3,}|##\s*Formatting\s+requirements|'
-                r'Never\s+mention\s+sources\s+or\s+formatting\s+instructions)',
-                '',
-                response
+                r'^.*?Source \d+:.*?Content:.*?\n[#]+\s',  # pattern
+                r'## ',  # replacement
+                response,  
+                flags=re.DOTALL
             ).strip()
             
             if not cleaned_response:
@@ -184,76 +184,111 @@ class ResearchAgent:
 
 def create_gradio_interface():
     research_agent = ResearchAgent()
+    
+    custom_css = """
+    .terminal { 
+        background: #000 !important; 
+        color: #0f0 !important; 
+        font-family: 'Courier New', monospace !important;
+        padding: 20px !important;
+    }
+    .terminal .chatbot { 
+        border: 1px solid #0f0 !important; 
+        border-radius: 0 !important; 
+        background: #001100 !important;
+    }
+    .terminal input {
+        background: #001100 !important;
+        color: #0f0 !important;
+        border: 1px solid #0f0 !important;
+    }
+    .terminal button {
+        background: #002200 !important;
+        color: #0f0 !important;
+        border: 1px solid #0f0 !important;
+    }
+    .terminal button:hover {
+        background: #004400 !important;
+    }
+    .markdown {
+        max-width: 100% !important;
+    }
+    @media (max-width: 600px) {
+        .chatbot { height: 400px !important; }
+        .terminal { padding: 10px !important; }
+    }
+    """
 
-    async def process_query(query: str, history: List[Tuple[str, str]]):
+    async def process_query(query: str, history: List[Dict]) -> Tuple[List[Dict], List[List[str]], dict]:
         try:
             response = await research_agent.research(query)
             if "error" in response:
-                return history + [(query, f"**Error**: {response['error']}")], []
+                new_history = history + [
+                    {"role": "user", "content": query},
+                    {"role": "assistant", "content": f"⚠️ **SYSTEM ERROR**: {response['error']}"}
+                ]
+                # Clear the textbox by returning an update.
+                return new_history, [], ""
             
-            answer = response["content"]
-            sources = [[s["title"], s["url"]] for s in response.get("sources", [])]
-            return history + [(query, answer)], sources
-            
+            answer = f"\n{response['content']}\n"
+            sources = [[s["title"], s.get("url", "N/A")] for s in response.get("sources", [])]
+            new_history = history + [
+                {"role": "user", "content": query},
+                {"role": "assistant", "content": answer}
+            ]
+            return new_history, sources, ""
         except Exception as e:
-            logging.error(f"UI Query Error: {str(e)}")
-            return history + [(query, f"**Error**: {str(e)}")], []
-    
-    def clear_input():
-        return ""
+            new_history = history + [
+                {"role": "user", "content": query},
+                {"role": "assistant", "content": f"⚠️ **SYSTEM ERROR**: {str(e)}"}
+            ]
+            return new_history, [], ""
 
-    with gr.Blocks(theme=gr.themes.Soft(), css=".markdown {max-width: 800px; margin: auto}") as interface:
-        gr.Markdown("# 🔍 AI Research Assistant")
-        
-        with gr.Tabs():
-            with gr.Tab("Chat"):
-                chatbot = gr.Chatbot(
-                    height=600,
-                    render_markdown=True,
-                    bubble_full_width=False
-                )
-                query_box = gr.Textbox(
-                    label="Research Query",
-                    placeholder="Enter your question...",
-                    lines=2,
-                    max_lines=5
-                )
-                with gr.Row():
-                    submit_btn = gr.Button("Search", variant="primary")
-                    clear_btn = gr.Button("Clear History")
-
-            with gr.Tab("References"):
-                sources_display = gr.DataFrame(
-                    headers=["Title", "URL"],
-                    datatype=["str", "markdown"],
-                    col_count=(2, "fixed"),
-                    interactive=False
-                )
-
-        submit_btn.click(
-            fn=process_query,
-            inputs=[query_box, chatbot],
-            outputs=[chatbot, sources_display]
-        ).then(
-            fn=clear_input,
-            inputs=[],
-            outputs=[query_box]
-        )
+    with gr.Blocks(theme=gr.themes.Default(primary_hue="green"), css=custom_css) as interface:
+        with gr.Column(elem_classes="terminal"):
+            gr.Markdown("# 🔍 RESEARCH TERMINAL", elem_classes="markdown")
+            
+            with gr.Tabs():
+                with gr.Tab("MAIN FRAME"):
+                    chatbot = gr.Chatbot(
+                        height=500,
+                        bubble_full_width=False,
+                        show_label=False,
+                        elem_classes="chatbot",
+                        type="messages",
+                        render_markdown=True
+                    )
+                    with gr.Row():
+                        # Removed clear_on_submit parameter
+                        query_box = gr.Textbox(
+                            placeholder="ENTER QUERY...",
+                            lines=2,
+                            max_lines=5,
+                            show_label=False
+                        )
+                        submit_btn = gr.Button("EXECUTE", variant="primary")
+                        
+                with gr.Tab("SOURCE DATABANKS"):
+                    sources_display = gr.DataFrame(
+                        headers=["TITLE", "URL"],
+                        datatype=["str", "markdown"],
+                        col_count=(2, "fixed"),
+                        interactive=False
+                    )
+            
+            gr.Markdown("STATUS: OPERATIONAL | MODEL: MIXTRAL-8x7B | API: TAVILY v1.2", elem_classes="markdown")
 
         query_box.submit(
-            fn=process_query,
+            process_query,
             inputs=[query_box, chatbot],
-            outputs=[chatbot, sources_display]
-        ).then(
-            fn=clear_input,
-            inputs=[],
-            outputs=[query_box]
+            outputs=[chatbot, sources_display, query_box],
+            show_progress=True
         )
-
-        clear_btn.click(
-            fn=lambda: [],
-            inputs=[],
-            outputs=[chatbot]
+        submit_btn.click(
+            process_query,
+            inputs=[query_box, chatbot],
+            outputs=[chatbot, sources_display, query_box],
+            show_progress=True
         )
 
     return interface
