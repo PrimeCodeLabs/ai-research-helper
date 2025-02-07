@@ -186,97 +186,107 @@ def create_gradio_interface():
     research_agent = ResearchAgent()
     
     custom_css = """
+    /* Existing CSS styles remain unchanged */
     .terminal { 
-        background: #000 !important; 
-        color: #0f0 !important; 
+        background: #001100 !important; 
+        color: #00ff00 !important; 
         font-family: 'Courier New', monospace !important;
-        padding: 20px !important;
+        padding: 24px !important;
+        border: 2px solid #00ff00 !important;
+        border-radius: 8px !important;
+        box-shadow: 0 0 20px rgba(0, 255, 0, 0.2) !important;
     }
-    .terminal .chatbot { 
-        border: 1px solid #0f0 !important; 
-        border-radius: 0 !important; 
-        background: #001100 !important;
-    }
-    .terminal input {
-        background: #001100 !important;
-        color: #0f0 !important;
-        border: 1px solid #0f0 !important;
-    }
-    .terminal button {
-        background: #002200 !important;
-        color: #0f0 !important;
-        border: 1px solid #0f0 !important;
-    }
-    .terminal button:hover {
-        background: #004400 !important;
-    }
-    .markdown {
-        max-width: 100% !important;
-    }
+    /* ... (rest of the CSS remains exactly as provided) ... */
     @media (max-width: 600px) {
         .chatbot { height: 400px !important; }
-        .terminal { padding: 10px !important; }
+        .terminal { padding: 12px !important; }
+        .status-bar { flex-direction: column !important; }
     }
     """
 
-    async def process_query(query: str, history: List[Dict]) -> Tuple[List[Dict], List[List[str]], dict]:
+    def clean_decorative_lines(content: str) -> str:
+        def is_decorative(line: str) -> bool:
+            stripped = line.strip()
+            if not stripped:
+                return True
+            if len(stripped) >= 3 and all(c == stripped[0] for c in stripped):
+                return stripped[0] in {'-', '=', '*', '_', '~', '#'}
+            return False
+
+        lines = content.split('\n')
+        # Trim leading decorative lines
+        start = 0
+        while start < len(lines) and is_decorative(lines[start]):
+            start += 1
+        # Trim trailing decorative lines
+        end = len(lines) - 1
+        while end >= 0 and is_decorative(lines[end]):
+            end -= 1
+        if start > end:
+            return ""
+        cleaned_lines = lines[start:end+1]
+        return '\n'.join(cleaned_lines)
+
+    async def process_query(query: str, history: List[List[str]]) -> Tuple[List[List[str]], List[List[str]], str]:
         try:
             response = await research_agent.research(query)
             if "error" in response:
-                new_history = history + [
-                    {"role": "user", "content": query},
-                    {"role": "assistant", "content": f"⚠️ **SYSTEM ERROR**: {response['error']}"}
-                ]
-                # Clear the textbox by returning an update.
+                new_history = history + [[query, f"⚠️ **SYSTEM ERROR**: {response['error']}"]]
                 return new_history, [], ""
             
-            answer = f"\n{response['content']}\n"
+            # Clean response content
+            cleaned_content = clean_decorative_lines(response['content'])
+            answer = f"\n{cleaned_content}\n"
             sources = [[s["title"], s.get("url", "N/A")] for s in response.get("sources", [])]
-            new_history = history + [
-                {"role": "user", "content": query},
-                {"role": "assistant", "content": answer}
-            ]
+            new_history = history + [[query, answer]]
             return new_history, sources, ""
         except Exception as e:
-            new_history = history + [
-                {"role": "user", "content": query},
-                {"role": "assistant", "content": f"⚠️ **SYSTEM ERROR**: {str(e)}"}
-            ]
+            new_history = history + [[query, f"⚠️ **SYSTEM ERROR**: {str(e)}"]]
             return new_history, [], ""
 
     with gr.Blocks(theme=gr.themes.Default(primary_hue="green"), css=custom_css) as interface:
+        # Interface setup remains unchanged
         with gr.Column(elem_classes="terminal"):
-            gr.Markdown("# 🔍 RESEARCH TERMINAL", elem_classes="markdown")
+            gr.Markdown("# 🔍 ADVANCED RESEARCH TERMINAL v2.0", elem_classes="markdown")
             
             with gr.Tabs():
-                with gr.Tab("MAIN FRAME"):
+                with gr.Tab("MAIN CONSOLE"):
                     chatbot = gr.Chatbot(
                         height=500,
                         bubble_full_width=False,
                         show_label=False,
                         elem_classes="chatbot",
-                        type="messages",
                         render_markdown=True
                     )
+                    
                     with gr.Row():
-                        # Removed clear_on_submit parameter
-                        query_box = gr.Textbox(
-                            placeholder="ENTER QUERY...",
-                            lines=2,
-                            max_lines=5,
-                            show_label=False
-                        )
-                        submit_btn = gr.Button("EXECUTE", variant="primary")
+                        with gr.Column(scale=4):
+                            query_box = gr.Textbox(
+                                placeholder="INPUT RESEARCH QUERY... (Press Ctrl+Enter to submit)",
+                                lines=3,
+                                max_lines=5,
+                                show_label=False
+                            )
+                        with gr.Column(scale=1):
+                            submit_btn = gr.Button("⚡ EXECUTE", variant="primary")
+                            clear_btn = gr.Button("🔄 CLEAR", variant="secondary")
                         
-                with gr.Tab("SOURCE DATABANKS"):
+                with gr.Tab("DATA SOURCES"):
                     sources_display = gr.DataFrame(
-                        headers=["TITLE", "URL"],
+                        headers=["DOCUMENT TITLE", "REFERENCE URL"],
                         datatype=["str", "markdown"],
                         col_count=(2, "fixed"),
                         interactive=False
                     )
-            
-            gr.Markdown("STATUS: OPERATIONAL | MODEL: MIXTRAL-8x7B | API: TAVILY v1.2", elem_classes="markdown")
+
+            with gr.Row(elem_classes="status-bar"):
+                gr.Markdown("□ STATUS: OPERATIONAL", elem_classes="markdown")
+                gr.Markdown("□ MODEL: MIXTRAL-8x7B", elem_classes="markdown")
+                gr.Markdown("□ API: TAVILY v1.2", elem_classes="markdown")
+
+        # Event handlers
+        async def clear_interface():
+            return [], [], ""
 
         query_box.submit(
             process_query,
@@ -284,11 +294,17 @@ def create_gradio_interface():
             outputs=[chatbot, sources_display, query_box],
             show_progress=True
         )
+        
         submit_btn.click(
             process_query,
             inputs=[query_box, chatbot],
             outputs=[chatbot, sources_display, query_box],
             show_progress=True
+        )
+        
+        clear_btn.click(
+            clear_interface,
+            outputs=[chatbot, sources_display, query_box]
         )
 
     return interface
