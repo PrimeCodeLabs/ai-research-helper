@@ -1,5 +1,8 @@
 import os
 import logging
+import time
+import concurrent.futures
+import backoff
 from datetime import datetime
 import re
 import gradio as gr
@@ -10,10 +13,15 @@ import sqlite3
 import json
 import hashlib
 import asyncio
-from tavily import AsyncTavilyClient
-from langchain_community.llms import HuggingFaceHub
 
+# Disable Gradio analytics
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "false"
+
+# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+from duckduckgo_search import DDGS
+from langchain_community.llms import HuggingFaceHub
 
 MODEL_CONFIG = {
     "analytical": {
@@ -49,7 +57,8 @@ class PersistentCacheManager:
         row = cursor.fetchone()
         if row:
             data_str, timestamp = row
-            if (datetime.now() - datetime.fromisoformat(timestamp)).seconds < self.ttl:
+            age = (datetime.now() - datetime.fromisoformat(timestamp)).seconds
+            if age < self.ttl:
                 return json.loads(data_str)
         return None
 
@@ -58,13 +67,45 @@ class PersistentCacheManager:
         data_str = json.dumps(value)
         timestamp = datetime.now().isoformat()
         self.conn.execute("REPLACE INTO cache (key, data, timestamp) VALUES (?, ?, ?)",
-                         (key, data_str, timestamp))
+                          (key, data_str, timestamp))
         self.conn.commit()
 
 class HybridSearchClient:
-    def __init__(self):
-        self.tavily = AsyncTavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+    def __init__(self, max_results=15, min_delay=0.2):
         self.cache = PersistentCacheManager()
+        self.ddg_max_results = max_results
+        self.min_delay = min_delay
+        self.last_request_time = 0.0
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    
+    def _wait_for_rate_limit(self):
+        current_time = time.time()
+        elapsed = current_time - self.last_request_time
+        if elapsed < self.min_delay:
+            time.sleep(self.min_delay - elapsed)
+        self.last_request_time = time.time()
+
+    @backoff.on_exception(
+        backoff.expo,
+        Exception,
+        max_tries=3,
+        max_time=30
+    )
+    def _safe_ddg_search(self, query: str) -> List[Dict]:
+        self._wait_for_rate_limit()
+        results_list = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=self.ddg_max_results):
+                results_list.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "content": r.get("body", r.get("snippet", "")) or ""
+                })
+        return results_list
+
+    def _concurrent_search(self, query: str) -> List[Dict]:
+        future = self.executor.submit(self._safe_ddg_search, query)
+        return future.result()
 
     async def search(self, query: str) -> Dict:
         cached = self.cache.get(query)
@@ -72,28 +113,16 @@ class HybridSearchClient:
             return cached
 
         try:
-            response = await self.tavily.search(
-                query,
-                search_depth="advanced",
-                max_results=15,
-                include_answer=True,
-                include_raw_content=True,
-                include_images=True,
-                max_age=5*365*24*60*60
-            )
-            
-            processed = {
-                "results": response.get("results", []),
-                "answer": response.get("answer", ""),
-                "raw_content": response.get("raw_content", "")
-            }
-            
+            results = await asyncio.to_thread(self._concurrent_search, query)
+            processed = {"results": results, "answer": "", "raw_content": ""}
             self.cache.set(query, processed)
             return processed
-            
         except Exception as e:
             logging.error(f"Search error: {str(e)}")
             return {"error": str(e)}
+
+    def __del__(self):
+        self.executor.shutdown(wait=False)
 
 class MultiModelManager:
     def __init__(self):
@@ -128,7 +157,7 @@ class ResearchAgent:
             "Formatting requirements:\n"
             "- Use ## for section headers\n"
             "- Use bullet points for lists\n"
-            "- Bold important terms\n"
+            "- **Bold** important terms\n"
             "- Never mention sources or formatting instructions\n\n"
             "Query: {query}\n\n"
             "Source Materials:\n{results}\n"
@@ -141,32 +170,35 @@ class ResearchAgent:
             if "error" in search_results:
                 return {"error": search_results["error"]}
             return await self._generate_answer(query, search_results)
-            
         except Exception as e:
             logging.error(f"Research error: {str(e)}")
             return {"error": str(e)}
 
     async def _generate_answer(self, query: str, results: Dict) -> Dict:
-        context = "\n".join([
-            f"Source {i+1}: {res['title']}\n"
-            f"Content: {res['content'][:300].strip()}{'...' if len(res['content']) > 300 else ''}\n"
-            for i, res in enumerate(results["results"])
-        ])
+        if "results" not in results:
+            return {"error": "No 'results' in search response."}
 
-        prompt = self.answer_template.format(query=query, results=context)
-        
+        context = []
+        for i, res in enumerate(results["results"]):
+            snippet = res['content'][:300].strip()
+            snippet += "..." if len(res['content']) > 300 else ""
+            context.append(f"Source {i+1}: {res['title']}\nContent: {snippet}\n")
+        combined_context = "\n".join(context)
+
+        prompt = self.answer_template.format(query=query, results=combined_context)
+
         try:
             response = await self.model.generate(prompt)
             cleaned_response = re.sub(
-                r'^.*?Source \d+:.*?Content:.*?\n[#]+\s',  # pattern
-                r'## ',  # replacement
-                response,  
+                r'^.*?Source \d+:.*?Content:.*?\n[#]+\s',
+                r'## ',
+                response,
                 flags=re.DOTALL
             ).strip()
-            
+
             if not cleaned_response:
                 raise ValueError("Empty response from model")
-                
+
             return {
                 "content": cleaned_response,
                 "sources": results["results"]
@@ -174,19 +206,22 @@ class ResearchAgent:
         except Exception as e:
             logging.error(f"Generation error: {str(e)}")
             return self._handle_fallback(query, results)
-    
+
     def _handle_fallback(self, query: str, results: Dict) -> Dict:
-        summary = "\n".join([f"- {res['title']}: {res['content'][:100]}" for res in results["results"]])
+        summary = "\n".join([
+            f"- {res['title']}: {res['content'][:100]}"
+            for res in results.get("results", [])
+        ])
         return {
             "content": f"**Preliminary Findings**\n\n{summary}",
-            "sources": results["results"]
+            "sources": results.get("results", [])
         }
 
 def create_gradio_interface():
     research_agent = ResearchAgent()
-    
+
     custom_css = """
-    /* Existing CSS styles remain unchanged */
+    body { background-color: #000 !important; }
     .terminal { 
         background: #001100 !important; 
         color: #00ff00 !important; 
@@ -196,58 +231,61 @@ def create_gradio_interface():
         border-radius: 8px !important;
         box-shadow: 0 0 20px rgba(0, 255, 0, 0.2) !important;
     }
-    /* ... (rest of the CSS remains exactly as provided) ... */
+    .chatbot {
+        height: 500px !important;
+        background: transparent !important;
+        border: 1px solid #00ff0077 !important;
+        overflow-y: auto !important;
+    }
+    .katex, .katex * {
+        color: #00ff00 !important;
+    }
     @media (max-width: 600px) {
         .chatbot { height: 400px !important; }
         .terminal { padding: 12px !important; }
-        .status-bar { flex-direction: column !important; }
     }
     """
 
     def clean_decorative_lines(content: str) -> str:
         def is_decorative(line: str) -> bool:
             stripped = line.strip()
-            if not stripped:
-                return True
             if len(stripped) >= 3 and all(c == stripped[0] for c in stripped):
                 return stripped[0] in {'-', '=', '*', '_', '~', '#'}
             return False
 
         lines = content.split('\n')
-        # Trim leading decorative lines
         start = 0
         while start < len(lines) and is_decorative(lines[start]):
             start += 1
-        # Trim trailing decorative lines
         end = len(lines) - 1
         while end >= 0 and is_decorative(lines[end]):
             end -= 1
-        if start > end:
-            return ""
-        cleaned_lines = lines[start:end+1]
-        return '\n'.join(cleaned_lines)
+        return '\n'.join(lines[start:end+1]) if start <= end else ""
 
     async def process_query(query: str, history: List[List[str]]) -> Tuple[List[List[str]], List[List[str]], str]:
         try:
             response = await research_agent.research(query)
             if "error" in response:
-                new_history = history + [[query, f"⚠️ **SYSTEM ERROR**: {response['error']}"]]
+                new_history = history + [[query, f"⚠️ **ERROR**: {response['error']}"]]
                 return new_history, [], ""
             
-            # Clean response content
             cleaned_content = clean_decorative_lines(response['content'])
             answer = f"\n{cleaned_content}\n"
             sources = [[s["title"], s.get("url", "N/A")] for s in response.get("sources", [])]
+
             new_history = history + [[query, answer]]
             return new_history, sources, ""
         except Exception as e:
-            new_history = history + [[query, f"⚠️ **SYSTEM ERROR**: {str(e)}"]]
+            err_msg = f"⚠️ **ERROR**: {str(e)}"
+            new_history = history + [[query, err_msg]]
             return new_history, [], ""
 
+    async def clear_interface():
+        return [], [], ""
+
     with gr.Blocks(theme=gr.themes.Default(primary_hue="green"), css=custom_css) as interface:
-        # Interface setup remains unchanged
         with gr.Column(elem_classes="terminal"):
-            gr.Markdown("# 🔍 ADVANCED RESEARCH TERMINAL v2.0", elem_classes="markdown")
+            gr.Markdown("# 🔍 AI RESEARCH TERMINAL")
             
             with gr.Tabs():
                 with gr.Tab("MAIN CONSOLE"):
@@ -256,21 +294,24 @@ def create_gradio_interface():
                         bubble_full_width=False,
                         show_label=False,
                         elem_classes="chatbot",
-                        render_markdown=True
+                        render_markdown=True,
+                        latex_delimiters=[
+                            {"left": "$$", "right": "$$", "display": True},
+                            {"left": "$", "right": "$", "display": False}
+                        ]
                     )
                     
                     with gr.Row():
-                        with gr.Column(scale=4):
-                            query_box = gr.Textbox(
-                                placeholder="INPUT RESEARCH QUERY... (Press Ctrl+Enter to submit)",
-                                lines=3,
-                                max_lines=5,
-                                show_label=False
-                            )
+                        query_box = gr.Textbox(
+                        show_label=False,
+                        placeholder="Type your query here...",
+                        container=False,
+                        autofocus=True
+                        )
                         with gr.Column(scale=1):
                             submit_btn = gr.Button("⚡ EXECUTE", variant="primary")
                             clear_btn = gr.Button("🔄 CLEAR", variant="secondary")
-                        
+                
                 with gr.Tab("DATA SOURCES"):
                     sources_display = gr.DataFrame(
                         headers=["DOCUMENT TITLE", "REFERENCE URL"],
@@ -280,28 +321,20 @@ def create_gradio_interface():
                     )
 
             with gr.Row(elem_classes="status-bar"):
-                gr.Markdown("□ STATUS: OPERATIONAL", elem_classes="markdown")
-                gr.Markdown("□ MODEL: MIXTRAL-8x7B", elem_classes="markdown")
-                gr.Markdown("□ API: TAVILY v1.2", elem_classes="markdown")
-
-        # Event handlers
-        async def clear_interface():
-            return [], [], ""
+                gr.Markdown("□ STATUS: OPERATIONAL")
+                gr.Markdown("□ MODEL: MIXTRAL-8x7B")
+                gr.Markdown("□ SEARCH: DUCKDUCKGO")
 
         query_box.submit(
             process_query,
             inputs=[query_box, chatbot],
-            outputs=[chatbot, sources_display, query_box],
-            show_progress=True
+            outputs=[chatbot, sources_display, query_box]
         )
-        
         submit_btn.click(
             process_query,
             inputs=[query_box, chatbot],
-            outputs=[chatbot, sources_display, query_box],
-            show_progress=True
+            outputs=[chatbot, sources_display, query_box]
         )
-        
         clear_btn.click(
             clear_interface,
             outputs=[chatbot, sources_display, query_box]
