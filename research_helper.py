@@ -1,8 +1,5 @@
 import os
 import logging
-import time
-import concurrent.futures
-import backoff
 from datetime import datetime
 import re
 import gradio as gr
@@ -13,6 +10,7 @@ import sqlite3
 import json
 import hashlib
 import asyncio
+from tavily import AsyncTavilyClient
 
 # Disable Gradio analytics
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "false"
@@ -20,7 +18,6 @@ os.environ["GRADIO_ANALYTICS_ENABLED"] = "false"
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-from duckduckgo_search import DDGS
 from langchain_community.llms import HuggingFaceHub
 
 MODEL_CONFIG = {
@@ -71,41 +68,9 @@ class PersistentCacheManager:
         self.conn.commit()
 
 class HybridSearchClient:
-    def __init__(self, max_results=15, min_delay=0.2):
+    def __init__(self):
+        self.tavily = AsyncTavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
         self.cache = PersistentCacheManager()
-        self.ddg_max_results = max_results
-        self.min_delay = min_delay
-        self.last_request_time = 0.0
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-    
-    def _wait_for_rate_limit(self):
-        current_time = time.time()
-        elapsed = current_time - self.last_request_time
-        if elapsed < self.min_delay:
-            time.sleep(self.min_delay - elapsed)
-        self.last_request_time = time.time()
-
-    @backoff.on_exception(
-        backoff.expo,
-        Exception,
-        max_tries=3,
-        max_time=30
-    )
-    def _safe_ddg_search(self, query: str) -> List[Dict]:
-        self._wait_for_rate_limit()
-        results_list = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=self.ddg_max_results):
-                results_list.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "content": r.get("body", r.get("snippet", "")) or ""
-                })
-        return results_list
-
-    def _concurrent_search(self, query: str) -> List[Dict]:
-        future = self.executor.submit(self._safe_ddg_search, query)
-        return future.result()
 
     async def search(self, query: str) -> Dict:
         cached = self.cache.get(query)
@@ -113,17 +78,28 @@ class HybridSearchClient:
             return cached
 
         try:
-            results = await asyncio.to_thread(self._concurrent_search, query)
-            processed = {"results": results, "answer": "", "raw_content": ""}
+            response = await self.tavily.search(
+                query,
+                search_depth="advanced",
+                max_results=7,
+                include_answer=True,
+                include_raw_content=True,
+                include_images=True,
+                max_age=10*365*24*60*60
+            )
+            
+            processed = {
+                "results": response.get("results", []),
+                "answer": response.get("answer", ""),
+                "raw_content": response.get("raw_content", "")
+            }
+            
             self.cache.set(query, processed)
             return processed
+            
         except Exception as e:
             logging.error(f"Search error: {str(e)}")
             return {"error": str(e)}
-
-    def __del__(self):
-        self.executor.shutdown(wait=False)
-
 class MultiModelManager:
     def __init__(self):
         self.llm = HuggingFaceHub(
@@ -170,35 +146,32 @@ class ResearchAgent:
             if "error" in search_results:
                 return {"error": search_results["error"]}
             return await self._generate_answer(query, search_results)
+            
         except Exception as e:
             logging.error(f"Research error: {str(e)}")
             return {"error": str(e)}
 
     async def _generate_answer(self, query: str, results: Dict) -> Dict:
-        if "results" not in results:
-            return {"error": "No 'results' in search response."}
+        context = "\n".join([
+            f"Source {i+1}: {res['title']}\n"
+            f"Content: {res['content'][:800].strip()}{'...' if len(res['content']) > 800 else ''}\n"
+            for i, res in enumerate(results["results"])
+        ])
 
-        context = []
-        for i, res in enumerate(results["results"]):
-            snippet = res['content'][:300].strip()
-            snippet += "..." if len(res['content']) > 300 else ""
-            context.append(f"Source {i+1}: {res['title']}\nContent: {snippet}\n")
-        combined_context = "\n".join(context)
-
-        prompt = self.answer_template.format(query=query, results=combined_context)
-
+        prompt = self.answer_template.format(query=query, results=context)
+        
         try:
             response = await self.model.generate(prompt)
             cleaned_response = re.sub(
-                r'^.*?Source \d+:.*?Content:.*?\n[#]+\s',
-                r'## ',
-                response,
+                r'^.*?Source \d+:.*?Content:.*?\n[#]+\s',  # pattern
+                r'## ',  # replacement
+                response,  
                 flags=re.DOTALL
             ).strip()
-
+            
             if not cleaned_response:
                 raise ValueError("Empty response from model")
-
+                
             return {
                 "content": cleaned_response,
                 "sources": results["results"]
@@ -206,17 +179,14 @@ class ResearchAgent:
         except Exception as e:
             logging.error(f"Generation error: {str(e)}")
             return self._handle_fallback(query, results)
-
+    
     def _handle_fallback(self, query: str, results: Dict) -> Dict:
-        summary = "\n".join([
-            f"- {res['title']}: {res['content'][:100]}"
-            for res in results.get("results", [])
-        ])
+        summary = "\n".join([f"- {res['title']}: {res['content'][:100]}" for res in results["results"]])
         return {
             "content": f"**Preliminary Findings**\n\n{summary}",
-            "sources": results.get("results", [])
+            "sources": results["results"]
         }
-
+    
 def create_gradio_interface():
     research_agent = ResearchAgent()
 
@@ -323,7 +293,7 @@ def create_gradio_interface():
             with gr.Row(elem_classes="status-bar"):
                 gr.Markdown("□ STATUS: OPERATIONAL")
                 gr.Markdown("□ MODEL: MIXTRAL-8x7B")
-                gr.Markdown("□ SEARCH: DUCKDUCKGO")
+                gr.Markdown("□ SEARCH: SEARXNG")
 
         query_box.submit(
             process_query,
