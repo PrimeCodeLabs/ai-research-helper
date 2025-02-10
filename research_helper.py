@@ -130,10 +130,12 @@ class ResearchAgent:
         self.answer_template = (
             "<s>[INST] Create a comprehensive report in markdown format based on these sources. "
             "Use natural section headers without numbering. Focus on key facts and quantitative data. "
+            "For mathematical expressions, use LaTeX with proper delimiters ($...$ for inline, $$...$$ for display math). "
             "Formatting requirements:\n"
             "- Use ## for section headers\n"
             "- Use bullet points for lists\n"
             "- **Bold** important terms\n"
+            "- Wrap all mathematical expressions in proper LaTeX delimiters\n"
             "- Never mention sources or formatting instructions\n\n"
             "Query: {query}\n\n"
             "Source Materials:\n{results}\n"
